@@ -95,12 +95,32 @@ def parse_file(uploaded_file) -> tuple[pd.DataFrame | None, str]:
         return None, f"Failed to parse file: {e}"
 
 
+def is_meaningful_numeric(series: pd.Series) -> bool:
+    """
+    Return True only if a numeric column is worth running descriptive stats on.
+    Excludes:
+      - ID-like columns (name contains 'id' as a whole word)
+      - Boolean-like columns (only 0/1/NaN values)
+    """
+    name_lower = series.name.lower()
+    # Reject if column name is or ends with 'id' (e.g. 'id', 'jobId', 'company_id')
+    if name_lower == "id" or name_lower.endswith("id"):
+        return False
+    # Reject if the only non-null values are 0 and 1 (boolean encoded as int)
+    unique_vals = set(series.dropna().unique())
+    if unique_vals <= {0, 1}:
+        return False
+    return True
+
+
 def describe_dataframe(df: pd.DataFrame) -> dict:
     """
     Extract key metadata from a DataFrame.
     This dict is stored in session_state and reused by the M2 AI report.
     """
-    num_cols = df.select_dtypes(include="number").columns.tolist()
+    raw_num_cols = df.select_dtypes(include="number").columns.tolist()
+    # Filter out ID columns and boolean-encoded columns
+    num_cols = [c for c in raw_num_cols if is_meaningful_numeric(df[c])]
     cat_cols = df.select_dtypes(include=["object", "category", "bool"]).columns.tolist()
     missing = int(df.isnull().sum().sum())
     missing_pct = round(missing / (df.shape[0] * df.shape[1]) * 100, 1) if df.size else 0
@@ -179,13 +199,68 @@ if uploaded_file is not None:
     with st.expander("🗂 Raw Data Preview (first 100 rows)", expanded=False):
         st.dataframe(df.head(100), use_container_width=True)
 
-    # ── Descriptive statistics for numeric columns ────────────
-    if meta["numeric_cols"]:
+    # ── Descriptive statistics with interactive column selector ──
+    all_num_cols = df.select_dtypes(include="number").columns.tolist()
+    if all_num_cols:
         with st.expander("📊 Descriptive Statistics", expanded=False):
-            st.dataframe(
-                df[meta["numeric_cols"]].describe().round(2),
-                use_container_width=True,
-            )
+            st.caption("Select which numeric columns to include. Columns likely to be IDs or flags are unchecked by default.")
+            selected_cols = []
+            # Render one checkbox per numeric column; default = passed the meaningful filter
+            cols_per_row = 4
+            rows = [all_num_cols[i:i+cols_per_row] for i in range(0, len(all_num_cols), cols_per_row)]
+            for row in rows:
+                cb_cols = st.columns(cols_per_row)
+                for cb_col, col_name in zip(cb_cols, row):
+                    default = is_meaningful_numeric(df[col_name])
+                    if cb_col.checkbox(col_name, value=default, key=f"stat_cb_{col_name}"):
+                        selected_cols.append(col_name)
+
+            if selected_cols:
+                st.dataframe(
+                    df[selected_cols].describe().round(2),
+                    use_container_width=True,
+                )
+            else:
+                st.info("Check at least one column above to see statistics.")
+
+    # ── Sample record ─────────────────────────────────────────
+    with st.expander("🪪 Sample Record (first non-null row)", expanded=True):
+        # Pick the first row that has the most non-null values
+        best_row_idx = df.isnull().sum(axis=1).idxmin()
+        sample = df.loc[best_row_idx]
+
+        # Display as a two-column key/value grid
+        def is_nonempty(v) -> bool:
+            """Safely check if a cell value is non-null and non-empty."""
+            try:
+                return pd.notna(v) and str(v).strip() != ""
+            except (ValueError, TypeError):
+                # pd.notna() raises ValueError on array-like values; treat those as non-empty
+                return True
+
+        fields = [(k, v) for k, v in sample.items() if is_nonempty(v)]
+        empty_fields = [(k, v) for k, v in sample.items() if not is_nonempty(v)]
+
+        if fields:
+            # Render non-null fields in a styled grid
+            grid_html = '<div style="display:grid;grid-template-columns:220px 1fr;gap:0.3rem 1rem;">'
+            for k, v in fields:
+                val_str = str(v)
+                # Truncate very long values (e.g. descriptionText)
+                display_val = val_str[:200] + "…" if len(val_str) > 200 else val_str
+                grid_html += (
+                    f'<div style="font-size:0.78rem;color:#6b7280;font-weight:600;'
+                    f'padding:0.35rem 0;border-bottom:1px solid #f3f4f6;word-break:break-word;">{k}</div>'
+                    f'<div style="font-size:0.88rem;color:#111827;padding:0.35rem 0;'
+                    f'border-bottom:1px solid #f3f4f6;word-break:break-word;">{display_val}</div>'
+                )
+            grid_html += "</div>"
+            st.markdown(grid_html, unsafe_allow_html=True)
+
+        if empty_fields:
+            st.caption(f"⚠ {len(empty_fields)} field(s) are empty in this record: "
+                       + ", ".join(k for k, _ in empty_fields[:10])
+                       + ("…" if len(empty_fields) > 10 else ""))
 
     # ── M2 handoff notice ─────────────────────────────────────
     st.markdown("""
