@@ -1,10 +1,16 @@
 """
-Data Explorer — M1: File Upload + Multi-format Parsing + Data Preview
+Data Explorer — M2: AI-powered Dataset Analysis Report
 """
 
-import streamlit as st
-import pandas as pd
 import io
+import os
+
+import pandas as pd
+import streamlit as st
+from dotenv import load_dotenv
+from openai import OpenAI
+
+load_dotenv()
 
 # ── Page config ───────────────────────────────────────────────
 st.set_page_config(
@@ -54,8 +60,33 @@ st.markdown("""
         color: #1e40af;
         margin-bottom: 1rem;
     }
+    .report-box {
+        background: #f8fafc;
+        border: 1px solid #e2e8f0;
+        border-radius: 12px;
+        padding: 1.5rem 1.8rem;
+        font-size: 0.95rem;
+        line-height: 1.75;
+        color: #1e293b;
+    }
 </style>
 """, unsafe_allow_html=True)
+
+
+# ── OpenRouter client ─────────────────────────────────────────
+@st.cache_resource
+def get_ai_client() -> OpenAI | None:
+    """
+    Initialize OpenRouter client using the API key from .env.
+    Returns None if the key is missing.
+    """
+    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    if not api_key:
+        return None
+    return OpenAI(
+        api_key=api_key,
+        base_url="https://openrouter.ai/api/v1",
+    )
 
 
 # ── Parsing ───────────────────────────────────────────────────
@@ -67,7 +98,6 @@ def parse_file(uploaded_file) -> tuple[pd.DataFrame | None, str]:
     name = uploaded_file.name.lower()
     try:
         if name.endswith(".csv"):
-            # Try UTF-8 first, fall back to latin-1 for non-ASCII files
             try:
                 df = pd.read_csv(uploaded_file, encoding="utf-8")
             except UnicodeDecodeError:
@@ -76,7 +106,6 @@ def parse_file(uploaded_file) -> tuple[pd.DataFrame | None, str]:
 
         elif name.endswith(".json"):
             raw = uploaded_file.read()
-            # Support both JSON array and JSON Lines formats
             try:
                 df = pd.read_json(io.BytesIO(raw), orient="records")
             except ValueError:
@@ -98,15 +127,11 @@ def parse_file(uploaded_file) -> tuple[pd.DataFrame | None, str]:
 def is_meaningful_numeric(series: pd.Series) -> bool:
     """
     Return True only if a numeric column is worth running descriptive stats on.
-    Excludes:
-      - ID-like columns (name contains 'id' as a whole word)
-      - Boolean-like columns (only 0/1/NaN values)
+    Excludes ID-like columns and boolean-encoded columns (only 0/1 values).
     """
     name_lower = series.name.lower()
-    # Reject if column name is or ends with 'id' (e.g. 'id', 'jobId', 'company_id')
     if name_lower == "id" or name_lower.endswith("id"):
         return False
-    # Reject if the only non-null values are 0 and 1 (boolean encoded as int)
     unique_vals = set(series.dropna().unique())
     if unique_vals <= {0, 1}:
         return False
@@ -116,10 +141,9 @@ def is_meaningful_numeric(series: pd.Series) -> bool:
 def describe_dataframe(df: pd.DataFrame) -> dict:
     """
     Extract key metadata from a DataFrame.
-    This dict is stored in session_state and reused by the M2 AI report.
+    Stored in session_state and reused by the M2 AI prompt builder.
     """
     raw_num_cols = df.select_dtypes(include="number").columns.tolist()
-    # Filter out ID columns and boolean-encoded columns
     num_cols = [c for c in raw_num_cols if is_meaningful_numeric(df[c])]
     cat_cols = df.select_dtypes(include=["object", "category", "bool"]).columns.tolist()
     missing = int(df.isnull().sum().sum())
@@ -135,6 +159,88 @@ def describe_dataframe(df: pd.DataFrame) -> dict:
         "column_names": df.columns.tolist(),
         "dtypes": df.dtypes.astype(str).to_dict(),
     }
+
+
+# ── AI prompt builder ─────────────────────────────────────────
+def build_analysis_prompt(filename: str, meta: dict, df: pd.DataFrame) -> str:
+    """
+    Build a structured prompt for the AI report.
+    Includes dataset metadata and sample statistics so the AI has concrete numbers to work with.
+    """
+    # Build a short stats summary for meaningful numeric columns
+    stats_lines = []
+    if meta["numeric_cols"]:
+        stats = df[meta["numeric_cols"]].describe().round(2)
+        for col in meta["numeric_cols"]:
+            s = stats[col]
+            stats_lines.append(
+                f"  - {col}: mean={s['mean']}, min={s['min']}, max={s['max']}, "
+                f"missing={df[col].isnull().sum()}"
+            )
+
+    # Top columns by missing value count (potential data quality signals)
+    missing_by_col = df.isnull().sum().sort_values(ascending=False)
+    top_missing = missing_by_col[missing_by_col > 0].head(8)
+    missing_lines = [f"  - {col}: {cnt} missing" for col, cnt in top_missing.items()]
+
+    prompt = f"""You are a data analyst. A user has uploaded a dataset and needs a clear, insightful report.
+
+Dataset: {filename}
+Shape: {meta['rows']} rows × {meta['columns']} columns
+Overall missing rate: {meta['missing_pct']}
+
+All columns ({meta['columns']} total):
+{', '.join(meta['column_names'])}
+
+Meaningful numeric columns:
+{chr(10).join(stats_lines) if stats_lines else '  (none detected)'}
+
+Columns with most missing values:
+{chr(10).join(missing_lines) if missing_lines else '  (no missing values)'}
+
+Text/categorical columns:
+{', '.join(meta['text_cols']) if meta['text_cols'] else '(none)'}
+
+Please write a concise dataset analysis report (around 200-300 words) that covers:
+1. What this dataset likely contains and its probable purpose
+2. Key observations about the data structure and quality
+3. Notable patterns or potential issues worth investigating
+4. 2-3 specific analysis questions this dataset could answer
+
+Write in clear, plain English. Be specific — reference actual column names and numbers. Avoid generic filler phrases.
+"""
+    return prompt
+
+
+# ── AI report generator ───────────────────────────────────────
+def generate_report(client: OpenAI, prompt: str) -> str:
+    """
+    Call the OpenRouter API and return the full response text.
+    Uses streaming so the user sees text appear progressively.
+    """
+    stream = client.chat.completions.create(
+        model="anthropic/claude-haiku-4-5",
+        messages=[{"role": "user", "content": prompt}],
+        stream=True,
+        max_tokens=1024,
+    )
+
+    report_placeholder = st.empty()
+    full_text = ""
+    for chunk in stream:
+        delta = chunk.choices[0].delta.content or ""
+        full_text += delta
+        report_placeholder.markdown(
+            f'<div class="report-box">{full_text}▌</div>',
+            unsafe_allow_html=True,
+        )
+
+    # Final render without the blinking cursor
+    report_placeholder.markdown(
+        f'<div class="report-box">{full_text}</div>',
+        unsafe_allow_html=True,
+    )
+    return full_text
 
 
 # ── Main UI ───────────────────────────────────────────────────
@@ -155,12 +261,12 @@ if uploaded_file is not None:
         st.error(error)
         st.stop()
 
-    # Store in session_state so M2/M3 can access without re-parsing
+    # Store in session_state so M3 can access without re-parsing
     st.session_state["df"] = df
     st.session_state["filename"] = uploaded_file.name
 
     meta = describe_dataframe(df)
-    st.session_state["meta"] = meta  # M2 will use this to build the AI prompt
+    st.session_state["meta"] = meta
 
     st.success(f"✅ Loaded: **{uploaded_file.name}**")
 
@@ -184,11 +290,11 @@ if uploaded_file is not None:
     # ── Column overview ───────────────────────────────────────
     with st.expander("📋 Column Overview", expanded=True):
         col_info = pd.DataFrame({
-            "Column":    df.columns,
-            "Type":      df.dtypes.astype(str).values,
-            "Non-null":  df.count().values,
-            "Missing":   df.isnull().sum().values,
-            "Sample":    [
+            "Column":   df.columns,
+            "Type":     df.dtypes.astype(str).values,
+            "Non-null": df.count().values,
+            "Missing":  df.isnull().sum().values,
+            "Sample":   [
                 str(df[c].dropna().iloc[0]) if df[c].dropna().shape[0] > 0 else "(all null)"
                 for c in df.columns
             ],
@@ -205,7 +311,6 @@ if uploaded_file is not None:
         with st.expander("📊 Descriptive Statistics", expanded=False):
             st.caption("Select which numeric columns to include. Columns likely to be IDs or flags are unchecked by default.")
             selected_cols = []
-            # Render one checkbox per numeric column; default = passed the meaningful filter
             cols_per_row = 4
             rows = [all_num_cols[i:i+cols_per_row] for i in range(0, len(all_num_cols), cols_per_row)]
             for row in rows:
@@ -214,59 +319,109 @@ if uploaded_file is not None:
                     default = is_meaningful_numeric(df[col_name])
                     if cb_col.checkbox(col_name, value=default, key=f"stat_cb_{col_name}"):
                         selected_cols.append(col_name)
-
             if selected_cols:
-                st.dataframe(
-                    df[selected_cols].describe().round(2),
-                    use_container_width=True,
-                )
+                st.dataframe(df[selected_cols].describe().round(2), use_container_width=True)
             else:
                 st.info("Check at least one column above to see statistics.")
 
     # ── Sample record ─────────────────────────────────────────
     with st.expander("🪪 Sample Record (first non-null row)", expanded=True):
-        # Pick the first row that has the most non-null values
         best_row_idx = df.isnull().sum(axis=1).idxmin()
         sample = df.loc[best_row_idx]
 
-        # Display as a two-column key/value grid
         def is_nonempty(v) -> bool:
-            """Safely check if a cell value is non-null and non-empty."""
             try:
-                return pd.notna(v) and str(v).strip() != ""
+                if pd.isna(v):
+                    return False
             except (ValueError, TypeError):
-                # pd.notna() raises ValueError on array-like values; treat those as non-empty
-                return True
+                pass
+            if isinstance(v, (list, dict)) and len(v) == 0:
+                return False
+            return str(v).strip() != ""
 
         fields = [(k, v) for k, v in sample.items() if is_nonempty(v)]
         empty_fields = [(k, v) for k, v in sample.items() if not is_nonempty(v)]
 
+        # Threshold above which a value gets a "show more" toggle
+        LONG_FIELD_THRESHOLD = 300
+
         if fields:
-            # Render non-null fields in a styled grid
-            grid_html = '<div style="display:grid;grid-template-columns:220px 1fr;gap:0.3rem 1rem;">'
             for k, v in fields:
                 val_str = str(v)
-                # Truncate very long values (e.g. descriptionText)
-                display_val = val_str[:200] + "…" if len(val_str) > 200 else val_str
-                grid_html += (
+                is_long = len(val_str) > LONG_FIELD_THRESHOLD
+                toggle_key = f"sample_expand_{k}"
+
+                col_label, col_value = st.columns([1, 3])
+                col_label.markdown(
                     f'<div style="font-size:0.78rem;color:#6b7280;font-weight:600;'
-                    f'padding:0.35rem 0;border-bottom:1px solid #f3f4f6;word-break:break-word;">{k}</div>'
-                    f'<div style="font-size:0.88rem;color:#111827;padding:0.35rem 0;'
-                    f'border-bottom:1px solid #f3f4f6;word-break:break-word;">{display_val}</div>'
+                    f'padding:0.4rem 0;word-break:break-word;">{k}</div>',
+                    unsafe_allow_html=True,
                 )
-            grid_html += "</div>"
-            st.markdown(grid_html, unsafe_allow_html=True)
+                with col_value:
+                    if is_long:
+                        expanded = st.session_state.get(toggle_key, False)
+                        display_val = val_str if expanded else val_str[:LONG_FIELD_THRESHOLD] + "…"
+                        st.markdown(
+                            f'<div style="font-size:0.88rem;color:#111827;padding:0.4rem 0;'
+                            f'word-break:break-word;white-space:pre-wrap;">{display_val}</div>',
+                            unsafe_allow_html=True,
+                        )
+                        btn_label = "Show less ▲" if expanded else "Show more ▼"
+                        if st.button(btn_label, key=f"btn_{toggle_key}"):
+                            st.session_state[toggle_key] = not expanded
+                            st.rerun()
+                    else:
+                        st.markdown(
+                            f'<div style="font-size:0.88rem;color:#111827;padding:0.4rem 0;'
+                            f'word-break:break-word;white-space:pre-wrap;">{val_str}</div>',
+                            unsafe_allow_html=True,
+                        )
+                st.divider()
 
         if empty_fields:
-            st.caption(f"⚠ {len(empty_fields)} field(s) are empty in this record: "
-                       + ", ".join(k for k, _ in empty_fields[:10])
-                       + ("…" if len(empty_fields) > 10 else ""))
+            st.caption(
+                f"⚠ {len(empty_fields)} field(s) are empty in this record: "
+                + ", ".join(k for k, _ in empty_fields[:10])
+                + ("…" if len(empty_fields) > 10 else "")
+            )
 
-    # ── M2 handoff notice ─────────────────────────────────────
+    # ── M2: AI Analysis Report ────────────────────────────────
+    st.markdown("---")
+    st.subheader("🤖 AI Analysis Report")
+
+    client = get_ai_client()
+
+    if client is None:
+        st.warning("⚠ No API key found. Add OPENROUTER_API_KEY to your .env file to enable AI reports.")
+    else:
+        # Only auto-generate once per file; store report in session_state
+        report_key = f"report_{uploaded_file.name}"
+
+        if report_key not in st.session_state:
+            with st.spinner("Analyzing your dataset…"):
+                prompt = build_analysis_prompt(uploaded_file.name, meta, df)
+                try:
+                    report = generate_report(client, prompt)
+                    st.session_state[report_key] = report
+                except Exception as e:
+                    st.error(f"API call failed: {e}")
+        else:
+            # Show cached report with regenerate option
+            st.markdown(
+                f'<div class="report-box">{st.session_state[report_key]}</div>',
+                unsafe_allow_html=True,
+            )
+
+        if report_key in st.session_state:
+            if st.button("🔄 Regenerate Report"):
+                del st.session_state[report_key]
+                st.rerun()
+
+    # ── M3 handoff notice ─────────────────────────────────────
     st.markdown("""
-    <div class="info-box">
-    ✨ <b>M1 complete</b> — Data loaded successfully.
-    Next up (M2): connect the Claude API to auto-generate a dataset analysis report.
+    <div class="info-box" style="margin-top:1rem;">
+    ✨ <b>M2 complete</b> — AI report generated.
+    Next up (M3): conversational multi-turn chat to ask follow-up questions about your data.
     </div>
     """, unsafe_allow_html=True)
 
