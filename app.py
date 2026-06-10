@@ -1,5 +1,5 @@
 """
-Data Explorer — M2: AI-powered Dataset Analysis Report
+Data Explorer — M3: Conversational Multi-turn Chat + AI Code Execution
 """
 
 import io
@@ -417,11 +417,129 @@ if uploaded_file is not None:
                 del st.session_state[report_key]
                 st.rerun()
 
-    # ── M3 handoff notice ─────────────────────────────────────
+    # ── M3: Conversational Chat ───────────────────────────────
+    st.markdown("---")
+    st.subheader("💬 Ask About Your Data")
+
+    if client is None:
+        st.warning("⚠ No API key found. Add OPENROUTER_API_KEY to your .env file to enable chat.")
+    else:
+        # Initialise chat history for this file
+        chat_key = f"chat_{uploaded_file.name}"
+        if chat_key not in st.session_state:
+            st.session_state[chat_key] = []
+
+        chat_history: list[dict] = st.session_state[chat_key]
+
+        # ── Render existing messages ──────────────────────────
+        for msg in chat_history:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+                # Re-render any dataframe result stored with the message
+                if "result_df" in msg:
+                    st.dataframe(msg["result_df"], use_container_width=True)
+
+        # ── Chat input ────────────────────────────────────────
+        user_input = st.chat_input("Ask a question about your dataset…")
+
+        if user_input:
+            # Show and store user message
+            with st.chat_message("user"):
+                st.markdown(user_input)
+            chat_history.append({"role": "user", "content": user_input})
+
+            # ── Build system prompt ───────────────────────────
+            system_prompt = f"""You are a data analyst assistant. The user has uploaded a dataset and wants to explore it through conversation.
+
+Dataset info:
+- File: {uploaded_file.name}
+- Shape: {meta['rows']} rows × {meta['columns']} columns
+- Columns: {', '.join(meta['column_names'])}
+- Numeric columns: {', '.join(meta['numeric_cols']) or 'none'}
+- Text columns: {', '.join(meta['text_cols']) or 'none'}
+- Missing rate: {meta['missing_pct']}
+
+The DataFrame is available as the variable `df`.
+
+When answering questions:
+1. Write a brief, clear explanation of your findings.
+2. If the question can be answered more precisely with data, include a code block with a single Python expression using `df` that returns a DataFrame or Series. Wrap it in ```python ... ```.
+3. Keep code simple — one expression, no assignments, no imports, no file operations.
+4. If the question is conceptual or interpretive, just answer in plain text without code.
+
+Example of good code:
+```python
+df.nlargest(5, 'applicantsCount')[['title', 'companyName', 'applicantsCount']]
+```"""
+
+            # Build messages list: system + full history
+            messages = [{"role": "system", "content": system_prompt}] + [
+                {"role": m["role"], "content": m["content"]}
+                for m in chat_history
+            ]
+
+            # ── Call AI and stream response ───────────────────
+            with st.chat_message("assistant"):
+                response_placeholder = st.empty()
+                full_response = ""
+
+                stream = client.chat.completions.create(
+                    model="anthropic/claude-haiku-4-5",
+                    messages=messages,
+                    stream=True,
+                    max_tokens=1024,
+                )
+                for chunk in stream:
+                    delta = chunk.choices[0].delta.content or ""
+                    full_response += delta
+                    response_placeholder.markdown(full_response + "▌")
+
+                response_placeholder.markdown(full_response)
+
+                # ── Extract and execute code block if present ─
+                result_df = None
+                if "```python" in full_response:
+                    code_block = full_response.split("```python")[1].split("```")[0].strip()
+
+                    # Safety check: block any write/import operations
+                    BLOCKED_KEYWORDS = [
+                        "import", "open(", "write", "to_csv", "to_excel",
+                        "to_json", "os.", "sys.", "eval(", "exec(",
+                        "subprocess", "__import__",
+                    ]
+                    is_safe = not any(kw in code_block for kw in BLOCKED_KEYWORDS)
+
+                    if is_safe:
+                        try:
+                            result = eval(code_block, {"df": df, "pd": pd})
+                            if isinstance(result, (pd.DataFrame, pd.Series)):
+                                result_df = result if isinstance(result, pd.DataFrame) else result.to_frame()
+                                st.dataframe(result_df, use_container_width=True)
+                            else:
+                                # Scalar result (count, mean, etc.)
+                                st.info(f"Result: {result}")
+                        except Exception as e:
+                            st.warning(f"Code execution failed: {e}")
+                    else:
+                        st.warning("Code blocked: contains disallowed operations.")
+
+            # Store assistant message (and result df if any)
+            assistant_msg: dict = {"role": "assistant", "content": full_response}
+            if result_df is not None:
+                assistant_msg["result_df"] = result_df
+            chat_history.append(assistant_msg)
+
+        # ── Clear chat button ─────────────────────────────────
+        if chat_history:
+            if st.button("🗑 Clear conversation"):
+                st.session_state[chat_key] = []
+                st.rerun()
+
+    # ── M4 handoff notice ─────────────────────────────────────
     st.markdown("""
     <div class="info-box" style="margin-top:1rem;">
-    ✨ <b>M2 complete</b> — AI report generated.
-    Next up (M3): conversational multi-turn chat to ask follow-up questions about your data.
+    ✨ <b>M3 complete</b> — Conversational chat with code execution enabled.
+    Next up (M4): AI-recommended dynamic Plotly visualizations.
     </div>
     """, unsafe_allow_html=True)
 
