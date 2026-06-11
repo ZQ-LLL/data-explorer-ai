@@ -368,7 +368,78 @@ def get_chart_specs(client: OpenAI, meta: dict, df: pd.DataFrame, cache_key: str
         return None
 
 
-# ── Data export helper ────────────────────────────────────────
+# ── Column analysis prompt builder ───────────────────────────
+def build_column_analysis_prompt(col_name: str, series: pd.Series, df: pd.DataFrame) -> str:
+    """
+    Build a targeted prompt for deep analysis of a single column.
+    Adapts based on whether the column is numeric, categorical, or text.
+    """
+    dtype = str(series.dtype)
+    total = len(series)
+    non_null = int(series.notna().sum())
+    missing = total - non_null
+    missing_pct = round(missing / total * 100, 1)
+
+    # Safely compute unique count
+    try:
+        n_unique = int(series.nunique())
+        is_hashable = True
+    except TypeError:
+        n_unique = -1
+        is_hashable = False
+
+    # Numeric column stats
+    if pd.api.types.is_numeric_dtype(series):
+        col_type = "numeric"
+        stats = series.describe().round(3)
+        extra = f"""Statistics:
+  mean={stats['mean']}, median={series.median():.3f}, std={stats['std']:.3f}
+  min={stats['min']}, max={stats['max']}
+  25th pct={stats['25%']}, 75th pct={stats['75%']}
+  skewness={series.skew():.3f}"""
+
+    # Nested objects (dict/list cells)
+    elif not is_hashable:
+        col_type = "nested object (dict/list)"
+        samples = series.dropna().head(5).tolist()
+        extra = f"""This column contains nested objects. Sample values:
+""" + "\n".join(f"  - {str(v)[:200]}" for v in samples)
+
+    # Low-cardinality categorical
+    elif n_unique <= 30:
+        col_type = "categorical"
+        top_vals = series.value_counts().head(10)
+        extra = f"""Top values (count):
+""" + "\n".join(f"  {v}: {c}" for v, c in top_vals.items())
+
+    # High-cardinality text
+    else:
+        col_type = "free text"
+        sample_vals = series.dropna().sample(min(5, non_null), random_state=42).tolist()
+        avg_len = int(series.dropna().astype(str).str.len().mean())
+        extra = f"""Average length: {avg_len} characters
+Sample values:
+""" + "\n".join(f"  - {str(v)[:200]}" for v in sample_vals)
+
+    return f"""You are a data analyst. Perform a deep analysis of a single column from a dataset.
+
+Column: "{col_name}"
+Type: {col_type} ({dtype})
+Total rows: {total}
+Non-null: {non_null} ({100 - missing_pct:.1f}%)
+Missing: {missing} ({missing_pct}%)
+Unique values: {n_unique}
+
+{extra}
+
+Please provide a focused analysis (150-250 words) covering:
+1. What this column likely represents and its role in the dataset
+2. Key patterns, distributions, or anomalies in the data
+3. Data quality observations (missing values, outliers, inconsistencies)
+4. 1-2 specific insights or follow-up questions this column raises
+
+Be specific and reference actual values/numbers. Always respond in English.
+"""
 def df_to_bytes(df: pd.DataFrame, fmt: str) -> tuple[bytes, str, str]:
     """Convert DataFrame to downloadable bytes. Returns (bytes, mime, extension)."""
     if fmt == "csv":
@@ -622,7 +693,117 @@ with col_board:
                 mime=mime,
             )
 
-    # AI Report
+    # Column Analysis
+    st.markdown("---")
+    with st.expander("🔬 Column Analysis", expanded=False):
+        if client is None:
+            st.warning("⚠ Add an API key in the sidebar to enable AI column analysis.")
+        else:
+            selected_col = st.selectbox(
+                "Select a column to analyse",
+                options=df.columns.tolist(),
+                key="col_analysis_select",
+            )
+
+            if selected_col:
+                series = df[selected_col]
+                non_null = int(series.notna().sum())
+                missing = len(series) - non_null
+
+                # Safely compute unique count (fails on dict/list valued columns)
+                try:
+                    n_unique = int(series.nunique())
+                    is_hashable = True
+                except TypeError:
+                    n_unique = -1  # sentinel for unhashable
+                    is_hashable = False
+
+                # Quick stats mini-cards
+                s1, s2, s3, s4 = st.columns(4)
+                s1.metric("Non-null", f"{non_null:,}")
+                s2.metric("Missing", f"{missing:,} ({round(missing/len(series)*100,1)}%)")
+                s3.metric("Unique values", f"{n_unique:,}" if is_hashable else "N/A (nested)")
+                s4.metric("Type", str(series.dtype))
+
+                # Show chart or samples depending on column type
+                if not is_hashable:
+                    # Nested objects (dict/list cells) — just show samples
+                    st.caption("⚠ This column contains nested objects (dicts/lists). Showing samples:")
+                    samples = series.dropna().head(5).tolist()
+                    for s in samples:
+                        st.markdown(
+                            f'<div style="font-size:0.83rem;background:#f8fafc;border-left:3px solid '
+                            f'#cbd5e1;padding:0.4rem 0.7rem;margin-bottom:0.3rem;border-radius:0 6px 6px 0;">'
+                            f'{str(s)[:300]}</div>',
+                            unsafe_allow_html=True,
+                        )
+                elif pd.api.types.is_numeric_dtype(series):
+                    fig = px.histogram(
+                        series.dropna().to_frame(),
+                        x=selected_col,
+                        title=f"Distribution of {selected_col}",
+                        height=250,
+                    )
+                    fig.update_layout(
+                        margin=dict(t=35, b=25, l=25, r=10),
+                        plot_bgcolor="white", paper_bgcolor="white",
+                    )
+                    st.plotly_chart(fig, use_container_width=True,
+                                    key=f"col_hist_{selected_col}")
+                elif n_unique <= 30:
+                    top_vals = series.value_counts().head(10).reset_index()
+                    top_vals.columns = [selected_col, "count"]
+                    fig = px.bar(
+                        top_vals, x=selected_col, y="count",
+                        title=f"Top values in {selected_col}",
+                        height=250,
+                    )
+                    fig.update_layout(
+                        margin=dict(t=35, b=25, l=25, r=10),
+                        plot_bgcolor="white", paper_bgcolor="white",
+                    )
+                    st.plotly_chart(fig, use_container_width=True,
+                                    key=f"col_bar_{selected_col}")
+                else:
+                    # Text column — show sample values
+                    st.caption("Sample values (text column):")
+                    samples = series.dropna().sample(min(5, non_null), random_state=42).tolist()
+                    for s in samples:
+                        st.markdown(
+                            f'<div style="font-size:0.83rem;background:#f8fafc;border-left:3px solid '
+                            f'#cbd5e1;padding:0.4rem 0.7rem;margin-bottom:0.3rem;border-radius:0 6px 6px 0;">'
+                            f'{str(s)[:300]}</div>',
+                            unsafe_allow_html=True,
+                        )
+
+                # AI analysis button + result
+                col_analysis_key = f"col_analysis_{uploaded_file.name}_{selected_col}"
+
+                if st.button("🤖 Analyse this column with AI",
+                             key=f"btn_analyse_{selected_col}"):
+                    with st.spinner(f"Analysing '{selected_col}'…"):
+                        try:
+                            prompt = build_column_analysis_prompt(selected_col, series, df)
+                            response = client.chat.completions.create(
+                                model=st.session_state.get("selected_model", "anthropic/claude-haiku-4-5"),
+                                messages=[{"role": "user", "content": prompt}],
+                                stream=False,
+                                max_tokens=800,
+                            )
+                            st.session_state[col_analysis_key] = response.choices[0].message.content.strip()
+                        except Exception as e:
+                            st.error(f"Analysis failed: {e}")
+
+                if col_analysis_key in st.session_state:
+                    st.markdown("**AI Analysis:**")
+                    st.markdown(
+                        f'<div class="report-box">{st.session_state[col_analysis_key]}</div>',
+                        unsafe_allow_html=True,
+                    )
+                    if st.button("🗑 Clear analysis", key=f"clear_col_{selected_col}"):
+                        del st.session_state[col_analysis_key]
+                        st.rerun()
+
     st.markdown("---")
     st.markdown("#### 🤖 AI Report")
     if client is None:
