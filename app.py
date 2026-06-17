@@ -18,6 +18,7 @@ from utils.ai import (
     get_ai_client,
     get_chart_specs,
 )
+from utils.agent import run_agent
 from utils.charts import render_chart
 from utils.parser import (
     SAMPLE_THRESHOLD,
@@ -77,7 +78,7 @@ with st.sidebar:
         "API Key (OpenRouter)",
         type="password",
         placeholder="sk-or-v1-… (or set in .env)",
-        help="Your key takes priority over the .env file.",
+        help="Used for all AI features including Agent mode.",
     )
     MODEL_OPTIONS = {
         "Claude Haiku 4.5 (fast)":   "anthropic/claude-haiku-4-5",
@@ -412,105 +413,236 @@ with col_board:
 
 
 # ════════════════════════════════════════════════════════════════
-# RIGHT — Chat
+# RIGHT — Chat + Agent
 # ════════════════════════════════════════════════════════════════
 with col_chat:
-    st.markdown("### 💬 Chat")
+    chat_tab, agent_tab = st.tabs(["💬 Chat", "🤖 Agent"])
 
-    if client is None:
-        st.warning("⚠ Add an API key in the sidebar to enable chat.")
-    else:
-        chat_key = f"chat_{uploaded_file.name}"
-        if chat_key not in st.session_state:
-            st.session_state[chat_key] = []
-        chat_history: list[dict] = st.session_state[chat_key]
+    # Initialise chat state outside tabs so agent tab can also access it
+    chat_key = f"chat_{uploaded_file.name}"
+    if chat_key not in st.session_state:
+        st.session_state[chat_key] = []
+    chat_history: list[dict] = st.session_state[chat_key]
 
-        for idx, msg in enumerate(chat_history):
-            with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
-                if "result_df" in msg:
-                    st.dataframe(msg["result_df"], use_container_width=True)
-                    if st.button("📌 Pin table", key=f"pin_df_{idx}"):
-                        st.session_state[pinned_key].append({
-                            "type": "df", "data": msg["result_df"],
-                            "label": f"Table · {msg['content'][:40]}…",
-                        })
-                        st.rerun()
-                if "result_fig" in msg:
-                    st.plotly_chart(msg["result_fig"], use_container_width=True,
-                                    key=f"history_fig_{idx}")
-                    if st.button("📌 Pin chart", key=f"pin_fig_{idx}"):
-                        st.session_state[pinned_key].append({
-                            "type": "fig", "data": msg["result_fig"],
-                            "label": f"Chart · {msg['content'][:40]}…",
-                        })
-                        st.rerun()
+    # ════════════════════════════════════════════════════════════
+    # CHAT TAB
+    # ════════════════════════════════════════════════════════════
+    with chat_tab:
+        if client is None:
+            st.warning("⚠ Add an OpenRouter API key in the sidebar to enable chat.")
+        else:
+            # Render existing messages
+            for idx, msg in enumerate(chat_history):
+                with st.chat_message(msg["role"]):
+                    st.markdown(msg["content"])
+                    if "result_df" in msg:
+                        st.dataframe(msg["result_df"], use_container_width=True)
+                        if st.button("📌 Pin table", key=f"pin_df_{idx}"):
+                            st.session_state[pinned_key].append({
+                                "type": "df", "data": msg["result_df"],
+                                "label": f"Table · {msg['content'][:40]}…",
+                            })
+                            st.rerun()
+                    if "result_fig" in msg:
+                        st.plotly_chart(msg["result_fig"], use_container_width=True,
+                                        key=f"history_fig_{idx}")
+                        if st.button("📌 Pin chart", key=f"pin_fig_{idx}"):
+                            st.session_state[pinned_key].append({
+                                "type": "fig", "data": msg["result_fig"],
+                                "label": f"Chart · {msg['content'][:40]}…",
+                            })
+                            st.rerun()
 
-        user_input = st.chat_input("Ask a question, request a chart, or edit your data…")
+            # chat_input inside chat_tab — only renders when this tab is active
+            user_input = st.chat_input(
+                "Ask a question, request a chart, or edit your data…",
+                key="chat_input",
+            )
 
-        if user_input:
-            with st.chat_message("user"):
-                st.markdown(user_input)
-            chat_history.append({"role": "user", "content": user_input})
+            # Handle new input
+            if user_input:
+                with st.chat_message("user"):
+                    st.markdown(user_input)
+                chat_history.append({"role": "user", "content": user_input})
 
-            messages = [{"role": "system", "content": build_chat_system_prompt(uploaded_file.name, meta)}] + [
-                {"role": m["role"], "content": m["content"]} for m in chat_history
-            ]
+                messages = [{"role": "system", "content": build_chat_system_prompt(uploaded_file.name, meta)}] + [
+                    {"role": m["role"], "content": m["content"]} for m in chat_history
+                ]
 
-            with st.chat_message("assistant"):
-                placeholder = st.empty()
-                full_response = ""
-                stream = client.chat.completions.create(
-                    model=st.session_state.get("selected_model", "anthropic/claude-haiku-4-5"),
-                    messages=messages, stream=True, max_tokens=1024,
-                )
-                for chunk in stream:
-                    delta = chunk.choices[0].delta.content or ""
-                    full_response += delta
-                    placeholder.markdown(full_response + "▌")
-                placeholder.markdown(full_response)
+                with st.chat_message("assistant"):
+                    placeholder = st.empty()
+                    full_response = ""
+                    stream = client.chat.completions.create(
+                        model=st.session_state.get("selected_model", "anthropic/claude-haiku-4-5"),
+                        messages=messages, stream=True, max_tokens=1024,
+                    )
+                    for chunk in stream:
+                        delta = chunk.choices[0].delta.content or ""
+                        full_response += delta
+                        placeholder.markdown(full_response + "▌")
+                    placeholder.markdown(full_response)
 
-                result_df = None
-                result_fig = None
+                    result_df = None
+                    result_fig = None
 
-                if "```python" in full_response:
-                    code_block = full_response.split("```python")[1].split("```")[0].strip()
-                    BLOCKED = ["import", "open(", "write", "to_csv", "to_excel",
-                               "to_json", "os.", "sys.", "eval(", "exec(",
-                               "subprocess", "__import__"]
-                    if not any(kw in code_block for kw in BLOCKED):
-                        try:
-                            result = eval(code_block, {"df": df, "pd": pd, "px": px})
-                            is_edit = "EDIT:" in full_response
-                            if isinstance(result, go.Figure):
-                                result_fig = result
-                                st.plotly_chart(result_fig, use_container_width=True,
-                                                key=f"chat_fig_{len(chat_history)}")
-                                st.caption("Use the 📌 Pin chart button below to add this to the Analysis Board.")
-                            elif isinstance(result, (pd.DataFrame, pd.Series)):
-                                result_df = result if isinstance(result, pd.DataFrame) else result.to_frame()
-                                if is_edit:
-                                    st.session_state[edit_key] = result_df.reset_index(drop=True)
-                                    st.success(f"✅ Dataset updated: now {len(result_df):,} rows × {len(result_df.columns)} columns.")
+                    if "```python" in full_response:
+                        code_block = full_response.split("```python")[1].split("```")[0].strip()
+                        BLOCKED = ["import", "open(", "write", "to_csv", "to_excel",
+                                   "to_json", "os.", "sys.", "eval(", "exec(",
+                                   "subprocess", "__import__"]
+                        if not any(kw in code_block for kw in BLOCKED):
+                            try:
+                                result = eval(code_block, {"df": df, "pd": pd, "px": px})
+                                is_edit = "EDIT:" in full_response
+                                if isinstance(result, go.Figure):
+                                    result_fig = result
+                                    st.plotly_chart(result_fig, use_container_width=True,
+                                                    key=f"chat_fig_{len(chat_history)}")
+                                    st.caption("Use the 📌 Pin chart button below to add this to the Analysis Board.")
+                                elif isinstance(result, (pd.DataFrame, pd.Series)):
+                                    result_df = result if isinstance(result, pd.DataFrame) else result.to_frame()
+                                    if is_edit:
+                                        st.session_state[edit_key] = result_df.reset_index(drop=True)
+                                        st.success(f"✅ Dataset updated: now {len(result_df):,} rows × {len(result_df.columns)} columns.")
+                                    else:
+                                        st.dataframe(result_df, use_container_width=True)
+                                        st.caption("Use the 📌 Pin table button below to add this to the Analysis Board.")
                                 else:
-                                    st.dataframe(result_df, use_container_width=True)
-                                    st.caption("Use the 📌 Pin table button below to add this to the Analysis Board.")
-                            else:
-                                st.info(f"Result: {result}")
-                        except Exception as e:
-                            st.warning(f"Code execution failed: {e}")
-                    else:
-                        st.warning("Code blocked: contains disallowed operations.")
+                                    st.info(f"Result: {result}")
+                            except Exception as e:
+                                st.warning(f"Code execution failed: {e}")
+                        else:
+                            st.warning("Code blocked: contains disallowed operations.")
 
-            assistant_msg: dict = {"role": "assistant", "content": full_response}
-            if result_df is not None and "EDIT:" not in full_response:
-                assistant_msg["result_df"] = result_df
-            if result_fig is not None:
-                assistant_msg["result_fig"] = result_fig
-            chat_history.append(assistant_msg)
-            st.rerun()
-
-        if chat_history:
-            if st.button("🗑 Clear chat"):
-                st.session_state[chat_key] = []
+                assistant_msg: dict = {"role": "assistant", "content": full_response}
+                if result_df is not None and "EDIT:" not in full_response:
+                    assistant_msg["result_df"] = result_df
+                if result_fig is not None:
+                    assistant_msg["result_fig"] = result_fig
+                chat_history.append(assistant_msg)
                 st.rerun()
+
+            if chat_history:
+                if st.button("🗑 Clear chat", key="clear_chat"):
+                    st.session_state[chat_key] = []
+                    st.rerun()
+
+    # ════════════════════════════════════════════════════════════
+    # AGENT TAB
+    # ════════════════════════════════════════════════════════════
+    with agent_tab:
+        st.caption("Agent plans and executes multiple analysis steps autonomously.")
+
+        import os
+        resolved_key = user_api_key.strip() or os.getenv("OPENROUTER_API_KEY", "").strip()
+
+        if not resolved_key:
+            st.warning("⚠ Add an OpenRouter API key in the sidebar to use Agent mode.")
+        else:
+            AGENT_MODELS = {
+                "claude-haiku-4-5 (fast, cheap)": "anthropic/claude-haiku-4-5",
+                "claude-sonnet-4-6 (smart)":      "anthropic/claude-sonnet-4-6",
+            }
+            agent_model_label = st.selectbox(
+                "Agent model",
+                list(AGENT_MODELS.keys()),
+                key="agent_model_select",
+            )
+            agent_model = AGENT_MODELS[agent_model_label]
+
+            # Example goals to help the user get started
+            with st.expander("💡 Example goals", expanded=False):
+                st.markdown("""
+- Give me a complete overview of this dataset
+- Find the columns with the most missing data and explain what that means
+- Show me the distribution of key numeric columns
+- What are the top 10 most common values in each categorical column?
+- Clean the data by removing rows where seniority level is missing, then summarize what's left
+                """)
+
+            user_goal = st.text_area(
+                "What do you want the Agent to analyse?",
+                placeholder="e.g. Give me a complete overview of this dataset and highlight the most interesting patterns.",
+                height=100,
+                key="agent_goal_input",
+            )
+
+            agent_events_key = f"agent_events_{uploaded_file.name}"
+
+            col_run, col_clear = st.columns([2, 1])
+            run_clicked = col_run.button("▶ Run Agent", type="primary",
+                                         disabled=not user_goal.strip())
+            if col_clear.button("🗑 Clear", key="clear_agent"):
+                st.session_state.pop(agent_events_key, None)
+                st.rerun()
+
+            if run_clicked and user_goal.strip():
+                st.session_state.pop(agent_events_key, None)
+                with st.spinner("Agent is working…"):
+                    events = run_agent(
+                        user_goal=user_goal,
+                        df=df,
+                        openrouter_api_key=resolved_key,
+                        model=agent_model,
+                        max_steps=10,
+                    )
+                st.session_state[agent_events_key] = events
+
+                # Apply any dataset updates from the agent
+                for ev in events:
+                    if ev["type"] == "df_update":
+                        st.session_state[edit_key] = ev["df"]
+                    if ev["type"] == "_final_df":
+                        # Update df in session if it changed
+                        if len(ev["df"]) != len(df):
+                            st.session_state[edit_key] = ev["df"]
+
+                st.rerun()
+
+            # ── Render stored agent events ────────────────────
+            if agent_events_key in st.session_state:
+                events = st.session_state[agent_events_key]
+                step_num = 0
+
+                for ev in events:
+                    if ev["type"] == "_final_df":
+                        continue  # internal use only
+
+                    elif ev["type"] == "text":
+                        st.markdown(ev["content"])
+
+                    elif ev["type"] == "tool":
+                        step_num += 1
+                        with st.expander(f"🔧 Step {step_num}: {ev['name']}", expanded=False):
+                            if ev["input"]:
+                                for k, v in ev["input"].items():
+                                    st.caption(f"**{k}:** {str(v)[:200]}")
+
+                    elif ev["type"] == "result":
+                        st.code(ev["content"], language=None)
+
+                    elif ev["type"] == "figure":
+                        st.plotly_chart(ev["fig"], use_container_width=True,
+                                        key=f"agent_fig_{step_num}_{ev['title'][:20]}")
+                        if st.button("📌 Pin to Board", key=f"pin_agent_fig_{step_num}"):
+                            st.session_state[pinned_key].append({
+                                "type": "fig",
+                                "data": ev["fig"],
+                                "label": f"Agent · {ev['title']}",
+                            })
+                            st.rerun()
+
+                    elif ev["type"] == "df_update":
+                        st.success(f"✅ {ev['message']}")
+
+                    elif ev["type"] == "summary":
+                        st.markdown("---")
+                        st.markdown("### 📋 Summary")
+                        st.markdown(f'<div class="report-box">{ev["content"]}</div>',
+                                    unsafe_allow_html=True)
+
+                    elif ev["type"] == "error":
+                        st.error(ev["content"])
+
+                    elif ev["type"] == "limit":
+                        st.warning(ev["content"])
